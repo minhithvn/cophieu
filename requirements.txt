@@ -1,0 +1,12 @@
+streamlit==1.39.0
+pandas==2.2.2
+numpy==1.26.4
+matplotlib==3.9.2
+plotly==5.24.1
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.2.2
+prophet==1.1.5
+cmdstanpy==1.2.5
+pystan==2.19.1.1
+
