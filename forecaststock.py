@@ -1,135 +1,136 @@
-# app.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 from prophet import Prophet
-from datetime import datetime
-import matplotlib.pyplot as plt
+from prophet.plot import plot_plotly
+import plotly.graph_objects as go
 import requests
 from bs4 import BeautifulSoup
-import certifi
+import ssl
 
-# =====================
-# Streamlit page config
-# =====================
-st.set_page_config(page_title="📈 Dự đoán cổ phiếu Việt Nam (Prophet)", layout="wide")
-st.title("📈 Dự đoán xu hướng cổ phiếu Việt Nam bằng Prophet")
-st.write("Nhập mã cổ phiếu HNX/HOSE, ví dụ: FPT, SSI, VNM, VIC, HAG ...")
+# -------------------------------------------
+# Tắt verify SSL để tránh lỗi CERTIFICATE_VERIFY_FAILED
+# -------------------------------------------
+ssl._create_default_https_context = ssl._create_unverified_context
 
-# =====================
-# Hàm lấy tên công ty từ HNX.vn
-# =====================
+# -------------------------------------------
+# Lấy tên công ty từ website HNX (nếu có)
+# -------------------------------------------
 def get_company_name(stock_code):
-    """
-    Lấy tên công ty từ HNX.vn
-    fallback: nếu lỗi SSL hoặc không tìm thấy → trả về thông báo
-    """
     try:
         url = f"https://www.hnx.vn/vi-vn/co-phieu-{stock_code}.html"
-        # Bỏ verify SSL để tránh lỗi trên máy không có chứng chỉ
-        res = requests.get(url, timeout=10, verify=False)
-        if res.status_code == 200:
-            # Dùng parser mặc định html.parser
-            soup = BeautifulSoup(res.text, "html.parser")
-            h1 = soup.find("h1")
-            if h1:
-                return h1.text.strip()
-            div_title = soup.find("div", class_="company-title")
-            if div_title:
-                return div_title.text.strip()
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=10, verify=False)
+        if resp.status_code != 200:
+            return "Không tìm thấy thông tin công ty"
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title = soup.find("title")
+        if title and stock_code.upper() in title.text:
+            name = title.text.split("|")[0].strip()
+            return name
         return "Không tìm thấy tên công ty"
     except Exception as e:
         return f"Không thể lấy tên công ty: {e}"
-# =====================
-# Nhập dữ liệu
-# =====================
-stock_code = st.text_input("Nhập mã cổ phiếu:", value="FPT").upper().strip()
-days_to_predict = st.slider("Số ngày cần dự đoán:", 7, 60, 15)
 
-if st.button("🔍 Phân tích & Dự đoán") and stock_code:
-    # --------------------
-    # Lấy tên công ty
-    # --------------------
-    company_name = get_company_name(stock_code)
-    st.write(f"**Mã cổ phiếu:** {stock_code}")
-    st.write(f"**Tên công ty:** {company_name}")
+# -------------------------------------------
+# Hàm tải dữ liệu an toàn (có cache)
+# -------------------------------------------
+@st.cache_data(ttl=3600)
+def load_stock_data(stock_code):
+    df = yf.download(f"{stock_code}.VN", period="6mo", progress=False)
+    if df.empty:
+        df = yf.download(stock_code, period="6mo", progress=False)
+    if df is None or df.empty:
+        return None
 
+    df = df.reset_index()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+    # tìm cột close
+    possible_close_cols = [c for c in df.columns if c.lower() in ("close", "adj close", "adjclose")]
+    if not possible_close_cols:
+        return None
+    close_col = possible_close_cols[0]
+    df = df[["Date", close_col]].rename(columns={close_col: "Close"})
+    df = df.dropna(subset=["Date", "Close"])
+    if df.empty:
+        return None
+    return df
+
+# -------------------------------------------
+# Huấn luyện mô hình Prophet (an toàn)
+# -------------------------------------------
+@st.cache_resource
+def train_prophet_model(df):
     try:
-        # --------------------
-        # Lấy dữ liệu cổ phiếu 1 năm qua
-        # --------------------
-        df = yf.download(f"{stock_code}.VN", period="1y", progress=False)
-        if df.empty:
-            df = yf.download(stock_code, period="1y", progress=False)
+        if "Date" in df.columns and "Close" in df.columns:
+            df = df.rename(columns={"Date": "ds", "Close": "y"})
+        df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
+        df["y"] = pd.to_numeric(df["y"], errors="coerce")
+        df = df.dropna(subset=["ds", "y"]).sort_values("ds")
+        df = df.drop_duplicates(subset="ds", keep="last").reset_index(drop=True)
 
-        if df.empty:
-            st.error("❌ Không tìm thấy dữ liệu cho mã này. Hãy thử mã khác.")
+        if len(df) < 10:
+            return None, "Dữ liệu quá ít để dự đoán"
+
+        model = Prophet(daily_seasonality=True)
+        model.fit(df)
+        return model, None
+    except Exception as e:
+        return None, f"Lỗi khi train Prophet: {e}"
+
+# -------------------------------------------
+# Giao diện chính
+# -------------------------------------------
+st.set_page_config(page_title="Dự đoán giá cổ phiếu - Prophet", layout="wide")
+
+st.title("📈 Dự đoán giá cổ phiếu bằng Prophet")
+
+stock_code = st.text_input("Nhập mã cổ phiếu (ví dụ: FPT, VCB, HPG...):").strip().upper()
+
+days_to_predict = st.slider("Số ngày muốn dự đoán", 7, 60, 14)
+
+if stock_code:
+    with st.spinner("⏳ Đang tải dữ liệu..."):
+        df = load_stock_data(stock_code)
+
+    if df is None or df.empty:
+        st.error("Không tìm thấy dữ liệu cho mã cổ phiếu này.")
+    else:
+        company_name = get_company_name(stock_code)
+        st.subheader(f"🏢 {stock_code} - {company_name}")
+        st.write("**Dữ liệu gần nhất:**")
+        st.dataframe(df.tail(10))
+
+        model, err = train_prophet_model(df)
+        if err:
+            st.error(err)
         else:
-            # --------------------
-            # Làm sạch dữ liệu
-            # --------------------
-            df = df.reset_index()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] for c in df.columns]
-            df = df[["Date", "Close"]].dropna()
-            if df.empty or df["Close"].nunique() < 5:
-                st.error("⚠️ Dữ liệu không đủ để huấn luyện mô hình.")
-            else:
-                df = df.rename(columns={"Date": "ds", "Close": "y"})
-                df["ds"] = pd.to_datetime(df["ds"])
-                df["y"] = df["y"].astype(float)
-
-                # --------------------
-                # Huấn luyện Prophet
-                # --------------------
-                model = Prophet(daily_seasonality=True)
-                model.fit(df)
-
-                # --------------------
-                # Dự đoán
-                # --------------------
+            with st.spinner("🧠 Đang dự đoán..."):
                 future = model.make_future_dataframe(periods=days_to_predict)
                 forecast = model.predict(future)
 
-                # --------------------
-                # Biểu đồ giá dự đoán
-                # --------------------
-                fig1 = model.plot(forecast)
-                st.pyplot(fig1)
+            st.subheader("📅 Biểu đồ dự đoán giá")
+            fig = plot_plotly(model, forecast)
+            st.plotly_chart(fig, use_container_width=True)
 
-                with st.expander("🔍 Xem chi tiết thành phần xu hướng"):
-                    fig2 = model.plot_components(forecast)
-                    st.pyplot(fig2)
+            st.subheader("📊 Bảng dữ liệu dự đoán")
+            st.dataframe(forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail(days_to_predict))
 
-                # --------------------
-                # Phân tích xu hướng
-                # --------------------
-                current_price = df["y"].iloc[-1]
-                avg_future = forecast["yhat"].iloc[-days_to_predict:].mean()
-                change_percent = ((avg_future - current_price) / current_price) * 100
-                trend = "📈 **Tăng**" if change_percent > 0 else "📉 **Giảm**"
-
-                st.markdown(f"""
-                ## 🔎 Kết quả dự báo
-                - **Mã cổ phiếu:** `{stock_code}`
-                - **Tên công ty:** {company_name}
-                - **Giá hiện tại:** {current_price:,.2f} VND  
-                - **Giá trung bình {days_to_predict} ngày tới:** {avg_future:,.2f} VND  
-                - **Chênh lệch:** {change_percent:+.2f}%  
-                - **Xu hướng dự kiến:** {trend}
-                """)
-
-                # --------------------
-                # Xuất CSV
-                # --------------------
-                df_export = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].tail(days_to_predict)
-                csv = df_export.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "📥 Tải dữ liệu dự đoán (CSV)",
-                    data=csv,
-                    file_name=f"{stock_code}_forecast_prophet.csv",
-                    mime="text/csv",
-                )
-
-    except Exception as e:
-        st.error(f"⚠️ Lỗi khi tải hoặc xử lý dữ liệu: {e}")
+            # Xu hướng dự đoán
+            last_price = df["Close"].iloc[-1]
+            avg_next = forecast["yhat"].tail(days_to_predict).mean()
+            diff_pct = ((avg_next - last_price) / last_price) * 100
+            trend = "📈 TĂNG" if diff_pct > 0 else "📉 GIẢM"
+            st.markdown(
+                f"""
+                ### 🔍 Phân tích xu hướng
+                - Giá hiện tại: **{last_price:,.2f}**
+                - Giá trung bình {days_to_predict} ngày tới: **{avg_next:,.2f}**
+                - Chênh lệch: **{diff_pct:+.2f}%**
+                - Dự báo xu hướng: **{trend}**
+                """
+            )
+else:
+    st.info("💡 Nhập mã cổ phiếu để bắt đầu dự đoán (ví dụ: FPT, VCB, HPG...)")
